@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""
+OmaTainment Real-Time 32-Band Audio Visualizer Engine
+Captures low-latency system/player audio via PulseAudio/PipeWire,
+computes 32-band log-spaced FFT with Dynamic Auto-Gain Control (AGC),
+and detects beat transients for the spectrum analyzer visualizer.
+"""
+
+import sys
+import os
+import signal
+import subprocess
+import time
+import array
+import math
+
+CHUNK_SIZE = 512
+BYTES_PER_CHUNK = CHUNK_SIZE * 2
+SAMPLE_RATE = 22050
+
+
+# 32 log-spaced frequency bands across 22050 Hz (Nyquist 11025 Hz, ~43 Hz / bin)
+BIN_EDGES = [
+    1, 2, 3, 4, 5, 6, 7, 8,
+    10, 12, 14, 17, 21, 26, 32, 39,
+    47, 56, 67, 80, 95, 112, 131, 152,
+    175, 190, 205, 220, 232, 242, 250, 255, 257
+]
+BIN_RANGES = [(BIN_EDGES[i], BIN_EDGES[i+1]) for i in range(len(BIN_EDGES)-1)]
+NUM_BANDS = len(BIN_RANGES)
+
+def spawn_recorder():
+    monitor_only = '--monitor' in sys.argv
+    # Attempt 1: parecord from default monitor with 20ms low latency
+    try:
+        proc = subprocess.Popen(
+            [
+                'parecord',
+                *(['--device=@DEFAULT_MONITOR@'] if monitor_only else []),
+                '--latency-msec=20',
+                '--raw',
+                f'--rate={SAMPLE_RATE}',
+                '--channels=1',
+                '--format=s16le'
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=BYTES_PER_CHUNK * 4
+        )
+        time.sleep(0.04)
+        if proc.poll() is None:
+            return proc
+    except Exception:
+        pass
+
+    # An output-only consumer must never fall back to a microphone source.
+    if monitor_only:
+        return None
+
+    # Attempt 2: Target OmaTainment PipeWire stream
+    try:
+        proc = subprocess.Popen(
+            [
+                'pw-record',
+                '--target=OmaTainment',
+                '--raw',
+                f'--rate={SAMPLE_RATE}',
+                '--channels=1',
+                '--format=s16',
+                '-'
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=BYTES_PER_CHUNK * 4
+        )
+        time.sleep(0.04)
+        if proc.poll() is None:
+            return proc
+    except Exception:
+        pass
+
+    # Attempt 3: General pw-record fallback
+    try:
+        proc = subprocess.Popen(
+            [
+                'pw-record',
+                '--raw',
+                f'--rate={SAMPLE_RATE}',
+                '--channels=1',
+                '--format=s16',
+                '-'
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=BYTES_PER_CHUNK * 4
+        )
+        return proc
+    except Exception:
+        return None
+
+def monitor_main():
+    """Small stdlib-only output envelope for the bar (no FFT dependency)."""
+    proc = spawn_recorder()
+    if not proc:
+        sys.exit(1)
+
+    def cleanup(sig=None, frame=None):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    previous = 0.0
+    average = 0.01
+    last_beat = 0.0
+    try:
+        while True:
+            raw = proc.stdout.read(BYTES_PER_CHUNK)
+            if not raw or len(raw) < BYTES_PER_CHUNK:
+                break
+            samples = array.array('h', raw)
+            if sys.byteorder != 'little':
+                samples.byteswap()
+            rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples)) / 32768.0
+            energy = min(1.0, rms * 12) if rms >= 0.002 else 0.0
+            now = time.monotonic()
+            beat = energy > max(0.12, average * 1.35) and energy - previous > 0.035 and now - last_beat > 0.18
+            if beat:
+                last_beat = now
+            average = average * 0.96 + energy * 0.04
+            previous = energy
+            sys.stdout.write(f'{{"energy":{energy:.3f},"beat":{int(beat)}}}\n')
+            sys.stdout.flush()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        cleanup()
+
+
+def main():
+    import numpy as np
+    WINDOW = np.hanning(CHUNK_SIZE).astype(np.float32)
+    proc = spawn_recorder()
+    if not proc:
+        sys.stderr.write("Failed to start audio recorder process.\n")
+        sys.exit(1)
+
+    def cleanup(sig=None, frame=None):
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=0.1)
+        except Exception:
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGPIPE, cleanup)
+
+    peaks = np.ones(NUM_BANDS, dtype=np.float32) * 1.5
+    prev_bass = 0.5
+    bass_history = []
+    silence_frames = 0
+
+    while True:
+        try:
+            raw = proc.stdout.read(BYTES_PER_CHUNK)
+            if not raw or len(raw) < BYTES_PER_CHUNK:
+                silence_frames += 1
+                if silence_frames > 8:
+                    time.sleep(0.025)
+                continue
+
+            silence_frames = 0
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Check RMS energy to suppress idle noise / silence
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            if rms < 0.006:
+                norm = np.zeros(NUM_BANDS, dtype=np.float32)
+                bass = 0.0
+                mid = 0.0
+                high = 0.0
+                energy = 0.0
+                beat = 0.0
+            else:
+                # Windowed FFT
+                fft = np.abs(np.fft.rfft(samples * WINDOW))
+
+                raw_bands = np.zeros(NUM_BANDS, dtype=np.float32)
+                for idx, (low, high) in enumerate(BIN_RANGES):
+                    sub = fft[low:high]
+                    if len(sub) > 0:
+                        raw_bands[idx] = float(np.mean(sub))
+
+                # Dynamic Auto-Gain Control (AGC) per band with floor to prevent noise amplification
+                peaks = np.maximum(raw_bands, peaks * 0.94)
+                peaks = np.maximum(peaks, 0.75)
+                norm = np.clip(raw_bands / peaks, 0.0, 1.0)
+
+            # Frequency band groups
+            bass = float(np.mean(norm[0:6]))
+            mid = float(np.mean(norm[6:18]))
+            high = float(np.mean(norm[18:]))
+            energy = float(np.mean(norm))
+
+            # Onset transient beat detection
+            delta = bass - prev_bass
+            prev_bass = bass
+
+            bass_history.append(bass)
+            if len(bass_history) > 24:
+                bass_history.pop(0)
+            avg_bass = float(np.mean(bass_history)) if bass_history else 0.1
+
+            is_transient = (delta > 0.14 and bass > 0.45)
+            is_surge = (bass > avg_bass * 1.35 and bass > 0.40)
+            beat = 1.0 if (is_transient or is_surge) else 0.0
+
+            bands_str = ",".join(f"{x:.2f}" for x in norm)
+            payload = f'{{"b":[{bands_str}],"bass":{bass:.2f},"mid":{mid:.2f},"high":{high:.2f},"energy":{energy:.2f},"beat":{beat:.1f}}}\n'
+
+            sys.stdout.write(payload)
+            sys.stdout.flush()
+
+        except (IOError, BrokenPipeError, KeyboardInterrupt):
+            break
+        except Exception:
+            time.sleep(0.02)
+
+    cleanup()
+
+if __name__ == '__main__':
+    if '--monitor' in sys.argv:
+        monitor_main()
+    else:
+        main()

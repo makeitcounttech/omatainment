@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""oma-phone: send what OmaTainment is playing to the phone over KDE Connect.
+
+  send URL [SECONDS]   open URL on the phone. YouTube opens in NewPipe at SECONDS (vnd.youtube link,
+                       which NewPipe claims and the removed YouTube app no longer does);
+                       moonfin://play?id=... opens a Movies/Series title in Moonfin.
+  status               paired+reachable device
+  now                  what the phone is playing (KDE Connect media notification), read-only
+  pull                 continue the phone's video here: read player/title/position, find the exact
+                       YouTube video (NewPipe) or Remux title (Moonfin), pause the phone.
+                       -> {ok, target: URL or remux:ID:TYPE, position, title, player}
+
+Phone -> laptop is handled by oma-open (default http(s) handler wrapper).
+Prints one JSON object.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+
+STREMIO = re.compile(r"^stremio:///detail/(movie|series)/tt\d+/[\w:]+$")
+MOONFIN = re.compile(r"^moonfin://(play|item)\?id=[0-9a-f]{32}(&(serverId|userId)=[0-9a-f]{32})*$")
+VIDEO_ID = re.compile(r"(?:v=|youtu\.be/|shorts/|live/)([A-Za-z0-9_-]{11})")
+YOUTUBE = re.compile(r"^https?://((www|m|music)\.)?(youtube\.com/(watch|shorts/|live/)|youtu\.be/)", re.I)
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def device():
+    wanted = os.environ.get("OMATAINMENT_PHONE_ID", "")
+    res = subprocess.run(["kdeconnect-cli", "-a", "--id-name-only"], capture_output=True, text=True, timeout=15)
+    for line in res.stdout.splitlines():
+        dev_id, _, name = line.partition(" ")
+        if dev_id and (not wanted or dev_id == wanted):
+            return dev_id, name
+    return None, None
+
+
+def with_time(url, seconds):
+    """YouTube link that continues at `seconds` (drops any existing t=)."""
+    parts = urllib.parse.urlsplit(url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query) if k not in ("t", "start")]
+    if seconds and seconds > 5:
+        query.append(("t", f"{int(seconds)}s"))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+def newpipe(url, seconds):
+    """vnd.youtube://ID?t=Ns: NewPipe's own scheme (YouTube app uninstalled) and keeps the time."""
+    match = VIDEO_ID.search(url)
+    if not match:
+        return with_time(url, seconds)
+    link = f"vnd.youtube://{match.group(1)}"
+    return link + (f"?t={int(seconds)}s" if seconds and seconds > 5 else "")
+
+
+def send(url, seconds=0):
+    if not (YOUTUBE.match(url) or STREMIO.match(url) or MOONFIN.match(url)):
+        return {"ok": False, "error": "This link can't be handed to the phone"}
+    dev_id, name = device()
+    if not dev_id:
+        return {"ok": False, "error": "Phone not reachable (KDE Connect)"}
+    if YOUTUBE.match(url):
+        url = newpipe(url, seconds)
+    if os.environ.get("OMATAINMENT_PHONE_DRYRUN") == "1":
+        return {"ok": True, "device": name, "url": url, "dryRun": True}
+    res = subprocess.run(["kdeconnect-cli", "-d", dev_id, "--share", url], capture_output=True, text=True, timeout=20)
+    if res.returncode != 0:
+        return {"ok": False, "error": (res.stderr or "Share failed").strip()[:200]}
+    return {"ok": True, "device": name, "url": url}
+
+
+NEWPIPE_PLAYERS = ("newpipe", "youtube", "tubular", "libretube", "piped")
+REMUX_PLAYERS = ("moonfin", "jellyfin", "findroid", "streamyfin")
+
+
+def mpris_path(dev_id):
+    return f"/modules/kdeconnect/devices/{dev_id}/mprisremote"
+
+
+def busctl(*args):
+    res = subprocess.run(["busctl", "--user", "--json=short", *args], capture_output=True, text=True, timeout=15)
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or "busctl failed").strip()[:200])
+    return json.loads(res.stdout)["data"] if res.stdout.strip() else None
+
+
+def prop(dev_id, name):
+    return busctl("get-property", "org.kde.kdeconnect", mpris_path(dev_id), "org.kde.kdeconnect.device.mprisremote", name)
+
+
+def now_playing(dev_id, refresh=True):
+    """Pick the phone player to continue: one that is playing, else the current one."""
+    iface = ("org.kde.kdeconnect", mpris_path(dev_id), "org.kde.kdeconnect.device.mprisremote")
+    if refresh:
+        try:
+            busctl("call", *iface, "requestPlayerList")
+        except RuntimeError:
+            pass
+    players = prop(dev_id, "playerList") or []
+    if not players:
+        return None
+    current = prop(dev_id, "player")
+    chosen = None
+    for name in [current] + [p for p in players if p != current]:
+        if name not in players:
+            continue
+        if name != prop(dev_id, "player"):
+            busctl("set-property", *iface, "player", "s", name)
+            import time
+            time.sleep(0.6)
+        if prop(dev_id, "isPlaying") and prop(dev_id, "title"):
+            chosen = name
+            break
+    if not chosen:
+        chosen = current if current in players else players[0]
+        if chosen != prop(dev_id, "player"):
+            busctl("set-property", *iface, "player", "s", chosen)
+            import time
+            time.sleep(0.6)
+    return {"player": chosen, "title": prop(dev_id, "title") or "", "artist": prop(dev_id, "artist") or "",
+            "album": prop(dev_id, "album") or "", "playing": bool(prop(dev_id, "isPlaying")),
+            "position": (prop(dev_id, "position") or 0) / 1000.0, "length": (prop(dev_id, "length") or 0) / 1000.0,
+            "players": players}
+
+
+def _norm(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def find_youtube(title, artist, length):
+    """Exact video for a NewPipe notification: same title, same channel when known, length within 3 s."""
+    query = f"ytsearch8:{title} {artist}".strip()
+    res = subprocess.run(["yt-dlp", "--no-warnings", "--flat-playlist", "--print",
+                          "%(id)s\t%(duration)s\t%(channel)s\t%(uploader)s\t%(title)s", query],
+                         capture_output=True, text=True, timeout=60)
+    best, best_score = None, -1
+    for line in res.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        vid, duration, channel, uploader, name = parts[:5]
+        try:
+            duration = float(duration)
+        except ValueError:
+            duration = 0
+        title_ok = _norm(name) == _norm(title)
+        channel_ok = not artist or _norm(artist) in (_norm(channel), _norm(uploader))
+        length_ok = not length or not duration or abs(duration - length) <= 3
+        if not (title_ok and length_ok):
+            continue
+        score = 2 * channel_ok + (1 if duration and length and abs(duration - length) <= 1.5 else 0)
+        if score > best_score:
+            best, best_score = vid, score
+    if best is None or (artist and best_score < 2):
+        return None
+    return f"https://www.youtube.com/watch?v={best}"
+
+
+def find_remux(info):
+    remux = os.environ.get("OMATAINMENT_REMUX_BIN", os.path.join(os.path.dirname(os.path.realpath(__file__)), "oma-remux"))
+    res = subprocess.run([remux, "match", info["title"], info["artist"], info["album"], str(info["length"])],
+                         capture_output=True, text=True, timeout=60)
+    found = json.loads(res.stdout or "{}")
+    return f"remux:{found['id']}:{found.get('type') or 'movie'}" if found.get("ok") else None
+
+
+def pull():
+    dev_id, name = device()
+    if not dev_id:
+        return {"ok": False, "error": "Fold not reachable (KDE Connect)"}
+    info = now_playing(dev_id)
+    if not info or not info["title"]:
+        return {"ok": False, "error": "Nothing is playing on the Fold"}
+    player = info["player"].lower()
+    if any(p in player for p in REMUX_PLAYERS):
+        target = find_remux(info)
+    elif any(p in player for p in NEWPIPE_PLAYERS):
+        target = find_youtube(info["title"], info["artist"], info["length"])
+    else:
+        return {"ok": False, "error": f"{info['player']} can't be continued here (NewPipe and Moonfin can)"}
+    if not target:
+        return {"ok": False, "error": f"Couldn't find \"{info['title']}\" exactly — not guessing"}
+    # Re-read the position right before pausing so the hand-off is as fresh as possible.
+    position = (prop(dev_id, "position") or 0) / 1000.0 if info["playing"] else info["position"]
+    if os.environ.get("OMATAINMENT_PHONE_DRYRUN") != "1" and info["playing"]:
+        busctl("call", "org.kde.kdeconnect", mpris_path(dev_id), "org.kde.kdeconnect.device.mprisremote",
+               "sendAction", "s", "Pause")
+    return {"ok": True, "target": target, "position": round(position), "title": info["title"],
+            "player": info["player"], "device": name, "paused": info["playing"]}
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "send":
+        out(send(argv[2], float(argv[3]) if len(argv) > 3 else 0))
+    elif cmd == "pull":
+        try:
+            out(pull())
+        except Exception as error:
+            out({"ok": False, "error": str(error)[:200] or "Could not read the Fold"})
+    elif cmd == "now":
+        dev_id, name = device()
+        try:
+            out({"ok": bool(dev_id), "device": name, **(now_playing(dev_id) or {})} if dev_id
+                else {"ok": False, "error": "Fold not reachable (KDE Connect)"})
+        except Exception as error:
+            out({"ok": False, "error": str(error)[:200]})
+    elif cmd == "status":
+        dev_id, name = device()
+        out({"ok": bool(dev_id), "device": name})
+    else:
+        out({"ok": False, "error": f"Unknown command {cmd}"})
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

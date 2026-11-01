@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""oma-open: default http(s) handler wrapper.
+
+Links shared from the phone (KDE Connect) that OmaTainment can play open in its floating player:
+  - YouTube videos/shorts/live      -> YouTube lane
+  - movie/series links (IMDb, TMDB, Trakt, Letterboxd-with-IMDb, Stremio-style ids, or any
+    shared text with an IMDb tt-id) -> Movies/Series lane via Remux
+Everything else — and any failure — opens in the personal Chromium (Chromium Private,
+Default profile; sing-box app scope routed via Mullvad Jakarta). Never Chromium Work.
+Phone shares are appended to $XDG_STATE_HOME/omatainment/phone-shares.log (no secrets: only the URL).
+Revert: set x-scheme-handler/http(s) back to chromium.desktop in ~/.config/mimeapps.list.
+"""
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+BROWSER = ["/usr/local/bin/singbox-browser", "launch", "chromium-private"]
+DETACH = ["systemd-run", "--user", "--scope", "--slice=app-graphical.slice", "--collect", "--quiet",
+          "--description=Chromium Private", "--", "setsid"]
+HERE = pathlib.Path(__file__).resolve().parent
+REMUX = os.environ.get("OMATAINMENT_REMUX_BIN", str(HERE / "oma-remux"))
+STATE = pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local/state")) / "omatainment"
+YOUTUBE = re.compile(r"^https?://((www|m|music)\.)?(youtube\.com/(watch|shorts/|live/)|youtu\.be/)", re.I)
+# Hosts whose links name a movie/show; anything else only counts if it carries an IMDb id.
+MOVIE_HOSTS = re.compile(r"^https?://([a-z0-9-]+\.)*(imdb\.com|themoviedb\.org|trakt\.tv|letterboxd\.com|"
+                         r"justwatch\.com|stremio\.com|web\.stremio\.com)/", re.I)
+IMDB_ID = re.compile(r"\btt\d{7,9}\b")
+
+
+def _comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def from_kdeconnect():
+    """True when KDE Connect launched us.
+
+    kdeconnectd opens shared URLs detached (QDesktopServices -> double fork), so our parent is
+    systemd, not kdeconnectd. The child still inherits the daemon's systemd unit: its cgroup
+    (app-org.kde.kdeconnect.daemon@...) and SYSTEMD_EXEC_PID. Check those, then the ancestors.
+    """
+    try:
+        with open("/proc/self/cgroup") as f:
+            if "kdeconnect" in f.read():
+                return True
+    except OSError:
+        pass
+    exec_pid = os.environ.get("SYSTEMD_EXEC_PID", "")
+    if exec_pid.isdigit() and _comm(exec_pid) == "kdeconnectd":
+        return True
+    pid = os.getppid()
+    for _ in range(8):
+        if _comm(pid) == "kdeconnectd":
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def log_share(url, route):
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "phone-shares.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{route}\t{url[:500]}\n")
+    except OSError:
+        pass
+
+
+def is_movie_link(url):
+    return bool(MOVIE_HOSTS.match(url) or IMDB_ID.search(url))
+
+
+def play(target):
+    res = subprocess.run(["omarchy-shell", "empire.omatainment", "playUrl", target],
+                         capture_output=True, text=True, timeout=15)
+    return res.returncode == 0
+
+
+def route(url):
+    """Return the route taken ('youtube' / 'remux' / None for browser)."""
+    if YOUTUBE.match(url):
+        return "youtube" if play(url) else None
+    if is_movie_link(url):
+        res = subprocess.run([REMUX, "lookup", url], capture_output=True, text=True, timeout=60)
+        found = json.loads(res.stdout or "{}")
+        if found.get("ok") and found.get("id"):
+            return "remux" if play(f"remux:{found['id']}:{found.get('type') or 'movie'}") else None
+    return None
+
+
+def main(args):
+    urls = [a for a in args if not a.startswith("-")]
+    if len(urls) == 1 and (from_kdeconnect() or os.environ.get("OMATAINMENT_FORCE_ROUTE") == "1"):
+        taken = None
+        try:
+            taken = route(urls[0])
+        except Exception:
+            taken = None
+        log_share(urls[0], taken or "browser")
+        if taken:
+            return 0
+    # Detach into its own scope + session. Chromium moves only its main process into
+    # app-org.chromium.Chromium-*.scope; GPU/zygote/renderers stay in the caller's cgroup, so a
+    # short-lived caller (CLI login flow, installer terminal, KDE Connect) exiting kills them and
+    # Chromium aborts with "GPU process isn't usable. Goodbye." (SIGTRAP).
+    try:
+        os.execvp(DETACH[0], DETACH + BROWSER + args)
+    except OSError:
+        os.execv(BROWSER[0], BROWSER + args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

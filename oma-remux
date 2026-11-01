@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""oma-remux: Movies/Series backend for OmaTainment, talking to the local Remux (Jellyfin API).
+
+All commands print one JSON object. Credentials live in ~/.config/omatainment/remux.json (0600)
+and are never printed except inside the loopback stream URL handed to the player.
+
+  search movie|series QUERY        live TMDB-backed search
+  seasons SERIES_ID                seasons of a series
+  episodes SERIES_ID SEASON_ID     episodes with watch progress
+  resolve ITEM_ID [SOURCE_ID] [--skip ID,ID]
+                                   pick the best stream that is really ready: ranked sources are
+                                   pre-flight probed (AIOStreams answers a not-ready debrid link with a
+                                   2-minute "being downloaded / something went wrong" clip), bad ones are
+                                   remembered for a few hours and the next one is tried. SOURCE_ID plays
+                                   exactly that source. Returns the source list for the in-player picker.
+  sources ITEM_ID                  every source with a readable label, ranked, bad ones marked
+  badsource ITEM_ID SOURCE_ID WHY  remember a source that played a placeholder (engine-side detection)
+  unplayed ITEM_ID                 clear the watched mark (undo an accidental autoplay advance)
+  progress JSON                    report position {id, source, session, position, paused}
+  stopped JSON                     final position (marks watched near the end)
+  continue                         resume list + next-up episodes
+  favorites                        favourite movies/series
+  favorite ITEM_ID on|off
+  next ITEM_ID                     the episode after ITEM_ID (for autoplay)
+  home                             rows for the browse window (continue, trending, popular, top rated)
+  browse movie|series              streaming-home rows (continue, trending, popular, Netflix, top rated, genres)
+  row movie|series ROW SORT START  one row/collection page (ROW from browse; SORT featured|rating|newest|az)
+  quality [720|1080|1440|2160]     get or set the maximum stream resolution (default 1080)
+  tiers ITEM_ID                    qualities this title really has: [{tier, cached, label}]
+  share ITEM_ID                    links to open this title elsewhere: {stremio, imdb, title}
+  handoff ITEM_ID SECONDS          continue on the Fold in Moonfin: store the position on the REMOTE Remux
+                                   (same server id + item ids) and return {moonfin, title}
+  match TITLE ARTIST ALBUM LENGTH  find what a phone player notification shows (Moonfin): an episode
+                                   (title = episode name, artist/album = show) or a movie; refuses guesses
+  lookup URL|TEXT                  find the title a shared link names (IMDb/TMDB ids, slug fallback);
+                                   series resolve to the episode to watch next: {id, type, title}
+"""
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+CONFIG = pathlib.Path(os.environ.get("OMATAINMENT_REMUX_CONFIG", pathlib.Path.home() / ".config/omatainment/remux.json"))
+CONTAINER = os.environ.get("OMATAINMENT_REMUX_CONTAINER", "remux-trial")
+TICKS = 10_000_000
+FIELDS = "Overview,ProductionYear,CommunityRating,OfficialRating,Genres,RunTimeTicks,UserData,ImageTags,BackdropImageTags,SeriesName,ParentIndexNumber,IndexNumber"
+PREFS = pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local/state")) / "omatainment/preferences.json"
+QUALITIES = (720, 1080, 1440, 2160)
+BAD_SOURCES = PREFS.parent / "bad-sources.json"
+BAD_TTL = 3 * 3600                 # a "being downloaded" source is usually ready again within hours
+PLACEHOLDER_MAX = 50 * 1024 * 1024  # AIOStreams status clips are ~3 MB; real episodes are hundreds of MB+
+PROBE_TIMEOUT = 15
+UA = 'MediaBrowser Client="OmaTainment", Device="omarchy", DeviceId="omatainment-omarchy", Version="0.2"'
+
+
+def out(obj):
+    print(json.dumps(obj, separators=(",", ":")), flush=True)
+
+
+def config():
+    try:
+        data = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        raise RuntimeError("Remux is not connected (missing ~/.config/omatainment/remux.json)")
+    return data["url"].rstrip("/"), data["token"], data["userId"]
+
+
+def ensure_running(base):
+    try:
+        urllib.request.urlopen(base + "/System/Info/Public", timeout=2).close()
+        return
+    except Exception:
+        pass
+    subprocess.run(["docker", "start", CONTAINER], capture_output=True, timeout=30)
+    for _ in range(40):
+        try:
+            urllib.request.urlopen(base + "/System/Info/Public", timeout=2).close()
+            return
+        except Exception:
+            time.sleep(0.5)
+    raise RuntimeError("Remux is not running")
+
+
+def api(path, method="GET", body=None, timeout=60):
+    base, token, _ = config()
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": f'{UA}, Token="{token}"'}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.URLError as error:
+        if isinstance(error, urllib.error.HTTPError):
+            raise RuntimeError(f"Remux error {error.code}")
+        ensure_running(base)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    return json.loads(raw) if raw.strip() else {}
+
+
+def q(**params):
+    return urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+
+
+def image(item_id, kind="Primary", **size):
+    base, _, _ = config()
+    return f"{base}/Items/{item_id}/Images/{kind}?" + q(quality=90, **size)
+
+
+def card(item):
+    """Compact item for the UI."""
+    kind = item.get("Type", "")
+    user = item.get("UserData") or {}
+    runtime = (item.get("RunTimeTicks") or 0) / TICKS
+    position = (user.get("PlaybackPositionTicks") or 0) / TICKS
+    tags = item.get("ImageTags") or {}
+    series_id = item.get("SeriesId") if kind == "Episode" else None
+    poster_id = series_id or item["Id"]
+    subtitle = ""
+    if kind == "Episode":
+        subtitle = f"S{item.get('ParentIndexNumber', 0)}·E{item.get('IndexNumber', 0)}  {item.get('Name', '')}"
+    elif item.get("ProductionYear"):
+        subtitle = str(item["ProductionYear"])
+    return {
+        "id": item["Id"],
+        "type": kind.lower(),
+        "title": item.get("SeriesName") if kind == "Episode" else item.get("Name", ""),
+        "subtitle": subtitle,
+        "year": item.get("ProductionYear"),
+        "overview": item.get("Overview") or "",
+        "rating": round(item["CommunityRating"], 1) if item.get("CommunityRating") else None,
+        "certification": item.get("OfficialRating") or "",
+        "genres": (item.get("Genres") or [])[:3],
+        "runtime": round(runtime),
+        "position": round(position),
+        "played": bool(user.get("Played")),
+        "favorite": bool(user.get("IsFavorite")),
+        "poster": image(poster_id, "Primary", maxHeight=480) if (tags.get("Primary") or series_id) else "",
+        "thumb": image(item["Id"], "Primary", maxWidth=400) if kind == "Episode" and tags.get("Primary") else "",
+        "backdrop": image(poster_id, "Backdrop", maxWidth=1280) if item.get("BackdropImageTags") or series_id else "",
+        "seriesId": series_id,
+        "seasonId": item.get("SeasonId") if kind == "Episode" else None,
+        "season": item.get("ParentIndexNumber"),
+        "episode": item.get("IndexNumber"),
+    }
+
+
+# ---------------------------------------------------------------- stream choice
+
+def _video(source):
+    return next((s for s in source.get("MediaStreams", []) if s.get("Type") == "Video"), {})
+
+
+def max_quality():
+    try:
+        value = int(json.loads(PREFS.read_text()).get("streamQuality", 1080))
+    except Exception:
+        value = 1080
+    return value if value in QUALITIES else 1080
+
+
+def set_quality(value):
+    value = int(value)
+    if value not in QUALITIES:
+        raise RuntimeError("Quality must be 720, 1080, 1440 or 2160")
+    try:
+        prefs = json.loads(PREFS.read_text())
+    except Exception:
+        prefs = {}
+    prefs["streamQuality"] = value
+    PREFS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PREFS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(prefs, indent=2))
+    tmp.replace(PREFS)
+    return {"ok": True, "quality": value}
+
+
+def _tier(hd):
+    if hd > 1700:
+        return 2160
+    if hd > 1200:
+        return 1440
+    if hd >= 1000:
+        return 1080
+    if hd >= 700:
+        return 720
+    return 480 if hd else 0
+
+
+def rank(source, index, cap=1080):
+    """Lower is better: cached, the highest tier not above the cap, SDR/HDR10 (no DV-only),
+    then the add-on's own order. Above-cap streams are only a fallback."""
+    name = source.get("Name") or ""
+    video = _video(source)
+    height = video.get("Height") or 0
+    width = video.get("Width") or 0
+    hd = max(height, int(width * 9 / 16))
+    range_type = (video.get("VideoRangeType") or "SDR").upper()
+    cached = "⚡" in name or "cached" in name.lower() or "[rd+]" in name.lower()
+    tiers = (2160, 1440, 1080, 720, 480)
+    tier = _tier(hd)
+    if tier == 0:
+        res = 20
+    elif tier <= cap:
+        res = [t for t in tiers if t <= cap].index(tier)       # cap itself = 0, then step down
+    else:
+        res = 10 + tiers[::-1].index(tier)                      # over the cap: smallest overshoot first
+    if range_type == "SDR":
+        colour = 0
+    elif range_type in ("HDR10", "HDR10PLUS", "DOVIWITHHDR10", "DOVIWITHSDR", "HDR"):
+        colour = 1
+    else:  # DOVI profile 5 / unknown: wrong colours outside DV players
+        colour = 3
+    codec = (video.get("Codec") or "").lower()
+    codec_score = 0 if codec in ("h264", "hevc", "av1", "vp9") else 2
+    return (0 if cached else 1, res, colour, codec_score, index)
+
+
+def describe(source):
+    video = _video(source)
+    audio = next((s for s in source.get("MediaStreams", []) if s.get("Type") == "Audio"), {})
+    height = video.get("Height") or 0
+    width = video.get("Width") or 0
+    tier = _tier(max(height, int(width * 9 / 16)))
+    label = {2160: "4K", 1440: "1440p"}.get(tier, f"{tier}p" if tier else "")
+    parts = [label, (video.get("Codec") or "").upper(), video.get("VideoRangeType") or "",
+             (audio.get("Codec") or "").upper(), f"{(source.get('Size') or 0) / 1e9:.1f} GB" if source.get("Size") else ""]
+    return " · ".join(p for p in parts if p and p != "SDR")
+
+
+def _lines(source):
+    return [re.sub(r"[\u200b-\u200d\u00a0\s]+", " ", line).strip() for line in (source.get("Name") or "").splitlines()]
+
+
+def provider(source):
+    """'RD · ComeTorz · RARBG' from the AIOStreams '⛉ [RD] ComeTorz · RARBG' line; '' if absent."""
+    for line in _lines(source):
+        if line.startswith("⛉"):
+            text = line.lstrip("⛉").strip()
+            text = re.sub(r"^\[([A-Za-z+]+)\]\s*", lambda m: m.group(1) + " · ", text)
+            return text.strip(" ·")
+    return ""
+
+
+def release(source):
+    """Release type from '〈Web-dl〉' / '〈Remux〉'."""
+    for line in _lines(source):
+        m = re.search(r"[\u2329\u3008\u27e8]\s*(.+?)\s*[\u232a\u3009\u27e9]", line)
+        if m:
+            return m.group(1).replace(" - ", "-").replace(" ", "")
+    return ""
+
+
+def _size_text(source):
+    if source.get("Size"):
+        return f"{source['Size'] / 1e9:.1f} GB"
+    for line in _lines(source):
+        m = re.search(r"[❖◈]\s*([\d.]+\s*[GM]B)", line)
+        if m:
+            return m.group(1).replace(" ", " ")
+    return ""
+
+
+def source_entry(source, index, cap, bad):
+    video = _video(source)
+    audio = next((s for s in source.get("MediaStreams", []) if s.get("Type") == "Audio"), {})
+    tier = _tier(max(video.get("Height") or 0, int((video.get("Width") or 0) * 9 / 16)))
+    name = (source.get("Name") or "").lower()
+    lines = _lines(source)
+    res = {2160: "4K", 1440: "1440p"}.get(tier, f"{tier}p" if tier else "")
+    codec = (video.get("Codec") or "").upper()
+    if not res and lines:                       # no stream metadata yet: read the add-on's own label
+        m = re.match(r"(4K|2160P|1440P|1080P|720P|480P)", lines[0].upper())
+        res = {"2160P": "4K"}.get(m.group(1), m.group(1).lower()) if m else ""
+    if not codec:
+        m = next((re.match(r"▣\s*(\w+)", l) for l in lines if l.startswith("▣")), None)
+        codec = {"AVC": "H264"}.get(m.group(1).upper(), m.group(1).upper()) if m else ""
+    parts = [res, release(source), codec, (video.get("VideoRangeType") or "").upper().replace("SDR", ""),
+             (audio.get("Codec") or "").upper(), _size_text(source)]
+    return {
+        "id": source["Id"], "rank": list(rank(source, index, cap)),
+        "label": " · ".join(p for p in parts if p),
+        "provider": provider(source) or "Unknown provider",
+        "library": any(line.startswith("☁") for line in lines),   # already in the debrid cloud library
+        "cached": "⚡" in name or "cached" in name or "[rd+]" in name,
+        "bad": bad.get(source["Id"], {}).get("why", ""),
+    }
+
+
+def _load_bad(item_id):
+    try:
+        data = json.loads(BAD_SOURCES.read_text())
+    except (OSError, ValueError):
+        data = {}
+    now = time.time()
+    data = {i: {s: v for s, v in m.items() if now - v.get("at", 0) < BAD_TTL} for i, m in data.items()}
+    return data, data.get(item_id, {})
+
+
+def mark_bad(item_id, source_id, why):
+    data, _ = _load_bad(item_id)
+    data.setdefault(item_id, {})[source_id] = {"why": why, "at": time.time()}
+    data = {i: m for i, m in data.items() if m}
+    BAD_SOURCES.parent.mkdir(parents=True, exist_ok=True)
+    tmp = BAD_SOURCES.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(BAD_SOURCES)
+    return {"ok": True}
+
+
+def clear_bad(item_id, source_id):
+    data, mine = _load_bad(item_id)
+    if source_id in mine:
+        mine.pop(source_id)
+        data[item_id] = mine
+        tmp = BAD_SOURCES.with_suffix(".tmp")
+        tmp.write_text(json.dumps({i: m for i, m in data.items() if m}))
+        tmp.replace(BAD_SOURCES)
+
+
+def probe(url):
+    """'ok' | 'placeholder' | 'error:<why>' from a 64 KiB range fetch (what the player would get first)."""
+    try:
+        request = urllib.request.Request(url, headers={"Range": "bytes=0-65535"})
+        with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+            response.read(65536)
+            span = response.headers.get("Content-Range", "")
+            total = span.rsplit("/", 1)[-1] if "/" in span else response.headers.get("Content-Length", "")
+            total = int(total) if str(total).isdigit() else 0
+        if total and total < PLACEHOLDER_MAX:
+            return "placeholder"
+        return "ok"
+    except urllib.error.HTTPError as error:
+        return f"error:HTTP {error.code}"
+    except Exception as error:
+        return "error:" + ("timed out" if "timed out" in str(error).lower() else error.__class__.__name__)
+
+
+def _why(result):
+    return "not ready on debrid" if result == "placeholder" else result.removeprefix("error:")
+
+
+def share(item_id):
+    _, _, uid = config()
+    item = api(f"/Users/{uid}/Items/{item_id}")
+    kind = item.get("Type")
+    if kind == "Episode":
+        series = api(f"/Users/{uid}/Items/{item['SeriesId']}")
+        imdb = (series.get("ProviderIds") or {}).get("Imdb")
+        if not imdb:
+            raise RuntimeError("No IMDb id for this show")
+        season, episode = item.get("ParentIndexNumber") or 1, item.get("IndexNumber") or 1
+        stremio = f"stremio:///detail/series/{imdb}/{imdb}:{season}:{episode}"
+        title = f"{series.get('Name', '')} S{season}·E{episode}"
+    else:
+        imdb = (item.get("ProviderIds") or {}).get("Imdb")
+        if not imdb:
+            raise RuntimeError("No IMDb id for this title")
+        stremio = f"stremio:///detail/movie/{imdb}/{imdb}"
+        title = item.get("Name", "")
+    return {"ok": True, "title": title, "stremio": stremio, "imdb": f"https://www.imdb.com/title/{imdb}/"}
+
+
+def _by_provider(provider_id, types="Movie,Series"):
+    _, _, uid = config()
+    data = api("/Items?" + q(AnyProviderIdEquals=provider_id, Recursive="true", IncludeItemTypes=types,
+                             userId=uid, Limit=1))
+    items = data.get("Items") or []
+    return items[0] if items else None
+
+
+def _series_target(series):
+    """The episode to play for a shared show: next up / in progress, else the first episode."""
+    _, _, uid = config()
+    nextup = api("/Shows/NextUp?" + q(userId=uid, SeriesId=series["Id"], Limit=1)).get("Items") or []
+    if nextup:
+        return nextup[0]
+    first = api(f"/Shows/{series['Id']}/Episodes?" + q(userId=uid, Limit=40)).get("Items") or []
+    first = [e for e in first if (e.get("ParentIndexNumber") or 0) > 0] or first
+    return first[0] if first else None
+
+
+def _clean(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def match(title, artist="", album="", length=0):
+    """Map a Moonfin media notification to a Remux item. Only exact (normalised) name matches count."""
+    _, _, uid = config()
+    length = float(length or 0)
+    def runtime_ok(item):
+        ticks = item.get("RunTimeTicks") or 0
+        return not length or not ticks or abs(ticks / TICKS - length) <= 120
+    # "S1:E2 - Name" / "S01E02 Name" style titles
+    se = re.match(r"^\s*S(\d+)\s*[:·.]?\s*E(\d+)\s*[-–:·]?\s*(.*)$", title, re.I)
+    episode_name = se.group(3) if se else title
+    shows = [n for n in (artist, album) if n and _clean(n) != _clean(title)]
+    for show in shows:
+        hits = [h for h in _search_type("Series", show, 8) if _clean(h["title"]) == _clean(show)]
+        for hit in hits[:2]:
+            eps = api(f"/Shows/{hit['id']}/Episodes?" + q(userId=uid, Fields="RunTimeTicks")).get("Items") or []
+            for e in eps:
+                by_number = se and e.get("ParentIndexNumber") == int(se.group(1)) and e.get("IndexNumber") == int(se.group(2))
+                by_name = _clean(e.get("Name")) == _clean(episode_name)
+                if (by_number or by_name) and runtime_ok(e):
+                    return {"ok": True, "id": e["Id"], "type": "episode",
+                            "title": f"{hit['title']} S{e.get('ParentIndexNumber', 0)}·E{e.get('IndexNumber', 0)}"}
+    movie_title = re.sub(r"\s*\((19|20)\d\d\)\s*$", "", title)
+    for hit in _search_type("Movie", movie_title, 10):
+        if _clean(hit["title"]) == _clean(movie_title):
+            item = api(f"/Users/{uid}/Items/{hit['id']}")
+            if runtime_ok(item):
+                return {"ok": True, "id": hit["id"], "type": "movie", "title": hit["title"]}
+    return {"ok": False, "error": f"No exact match for \"{title}\" in Remux"}
+
+
+def lookup(text):
+    """Map a shared movie/show link (or text containing one) to a playable Remux item."""
+    text = text.strip()
+    item = None
+    imdb = re.search(r"\btt\d{7,9}\b", text)
+    if imdb:
+        item = _by_provider(f"imdb.{imdb.group(0)}")
+    tmdb = re.search(r"themoviedb\.org/(movie|tv)/(\d+)", text)
+    if not item and tmdb:
+        item = _by_provider(f"tmdb.{tmdb.group(2)}", "Movie" if tmdb.group(1) == "movie" else "Series")
+    if not item:
+        # Slug fallback (trakt.tv/movies/dune-part-two-2024, letterboxd.com/film/dune-part-two/...).
+        slug = re.search(r"/(?:movies|shows|film|movie|tv-show|tv|series)/([a-z0-9-]+)", text, re.I)
+        if slug:
+            words = slug.group(1).split("-")
+            year = words.pop() if words and re.fullmatch(r"(19|20)\d\d", words[-1]) else None
+            query = " ".join(words)
+            kind = "series" if re.search(r"/(shows|tv-show|tv|series)/", text, re.I) else "movie"
+            hits = [h for h in search(kind, query)["items"] if _relevance(h, query) == 0
+                    and (not year or str(h.get("year") or "") == year)]
+            if hits:
+                _, _, uid = config()
+                item = api(f"/Users/{uid}/Items/{hits[0]['id']}")
+    if not item:
+        raise RuntimeError("Title not found in Remux")
+    title = item.get("Name", "")
+    if item.get("Type") == "Series":
+        episode = _series_target(item)
+        if not episode:
+            raise RuntimeError("No episodes for this show")
+        return {"ok": True, "id": episode["Id"], "type": "episode", "title": title,
+                "subtitle": f"S{episode.get('ParentIndexNumber', 0)}·E{episode.get('IndexNumber', 0)}"}
+    return {"ok": True, "id": item["Id"], "type": (item.get("Type") or "movie").lower(), "title": title}
+
+
+REMOTE_SSH = os.environ.get("OMATAINMENT_REMOTE_SSH", "")
+REMOTE_REMUX = os.environ.get("OMATAINMENT_REMOTE_REMUX", "http://127.0.0.1:18096")
+# Runs on the REMOTE. Reads "token uid item ticks" from stdin (credentials never reach argv or output).
+_REMOTE_SET_POSITION = r'''
+import json, sys, urllib.request
+token, uid, item, ticks = sys.stdin.readline().split()
+h = {"Authorization": 'MediaBrowser Token="%s", Client="OmaTainment", Device="omarchy", DeviceId="omatainment-omarchy", Version="0.2"' % token,
+     "Content-Type": "application/json"}
+base = sys.argv[1]
+info = json.load(urllib.request.urlopen(base + "/System/Info/Public", timeout=10))
+r = urllib.request.Request("%s/UserItems/%s/UserData?userId=%s" % (base, item, uid), headers=h, method="POST",
+                           data=json.dumps({"PlaybackPositionTicks": int(ticks), "Played": False}).encode())
+urllib.request.urlopen(r, timeout=15).read()
+r = urllib.request.Request("%s/Users/%s/Items/%s" % (base, uid, item), headers=h)
+print(json.dumps({"serverId": info.get("Id"), "ticks": json.load(urllib.request.urlopen(r, timeout=15)).get("UserData", {}).get("PlaybackPositionTicks")}))
+'''
+
+
+def handoff(item_id, seconds):
+    """Continue a Remux title on the Fold (Moonfin talks to the REMOTE Remux, a copy of this library)."""
+    if not REMOTE_SSH:
+        raise RuntimeError("Set OMATAINMENT_REMOTE_SSH before remote handoff")
+    # Accept a destination, never SSH options, URI syntax or shell fragments.
+    if not re.fullmatch(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:]+\])", REMOTE_SSH):
+        raise RuntimeError("Invalid remote SSH destination")
+    # This is the server's own loopback endpoint, accessed through SSH.
+    if not re.fullmatch(r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?", REMOTE_REMUX):
+        raise RuntimeError("Invalid remote Remux URL: use an HTTP(S) loopback endpoint")
+    try:
+        port = urllib.parse.urlsplit(REMOTE_REMUX).port
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("port out of range")
+    except ValueError as error:
+        raise RuntimeError("Invalid remote Remux URL port") from error
+    _, token, uid = config()
+    item = api(f"/Users/{uid}/Items/{item_id}")
+    title = item.get("SeriesName") or item.get("Name", "")
+    if item.get("Type") == "Episode":
+        title += f" S{item.get('ParentIndexNumber', 0)}·E{item.get('IndexNumber', 0)}"
+    ticks = int(max(0.0, float(seconds) - 3) * TICKS) if float(seconds) > 30 else 0
+    command = shlex.join(["python3", "-c", _REMOTE_SET_POSITION, REMOTE_REMUX])
+    res = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", REMOTE_SSH, command],
+                         input=f"{token} {uid} {item_id} {ticks}\n", capture_output=True, text=True, timeout=40)
+    synced, server_id = False, ""
+    try:
+        data = json.loads(res.stdout.strip().splitlines()[-1])
+        server_id = data.get("serverId") or ""
+        synced = abs((data.get("ticks") or 0) - ticks) < TICKS
+    except (ValueError, IndexError):
+        pass
+    if not server_id:
+        server_id = (api("/System/Info/Public") or {}).get("Id", "")
+    # userId omitted: Remux returns a dashed UUID, Moonfin only uses it to skip the profile picker.
+    query = urllib.parse.urlencode({k: v for k, v in (("id", item_id), ("serverId", server_id)) if v})
+    return {"ok": True, "moonfin": f"moonfin://play?{query}", "title": title, "positionSynced": synced,
+            "position": ticks // TICKS}
+
+
+def tiers(item_id):
+    _, _, uid = config()
+    info = api(f"/Items/{item_id}/PlaybackInfo?" + q(userId=uid), method="POST",
+               body={"UserId": uid, "EnableDirectPlay": True, "EnableDirectStream": True}, timeout=90)
+    by_tier = {}
+    for index, source in enumerate(info.get("MediaSources") or []):
+        video = _video(source)
+        tier = _tier(max(video.get("Height") or 0, int((video.get("Width") or 0) * 9 / 16)))
+        if tier >= 720:
+            by_tier.setdefault(min(tier, 2160), []).append((index, source))
+    items = []
+    for tier in sorted(by_tier):
+        # Label with the copy the player would actually pick at this cap.
+        index, source = min(by_tier[tier], key=lambda pair: rank(pair[1], pair[0], tier))
+        name = (source.get("Name") or "").lower()
+        cached = "⚡" in name or "cached" in name or "[rd+]" in name
+        items.append({"tier": tier, "cached": cached, "label": describe(source)})
+    return {"ok": True, "id": item_id, "tiers": items, "quality": max_quality()}
+
+
+def _stream_url(base, token, item_id, source_id):
+    return f"{base}/Videos/{item_id}/stream?" + q(static="true", mediaSourceId=source_id, api_key=token)
+
+
+def sources(item_id, info=None):
+    _, _, uid = config()
+    if info is None:
+        info = api(f"/Items/{item_id}/PlaybackInfo?" + q(userId=uid), method="POST",
+                   body={"UserId": uid, "EnableDirectPlay": True, "EnableDirectStream": True}, timeout=90)
+    cap = max_quality()
+    _, bad = _load_bad(item_id)
+    entries = [source_entry(src, i, cap, bad) for i, src in enumerate(info.get("MediaSources") or [])]
+    entries.sort(key=lambda e: e["rank"])
+    return {"ok": True, "id": item_id, "sources": entries, "quality": cap}
+
+
+def resolve(item_id, source_id=None, skip=()):
+    base, token, uid = config()
+    item = api(f"/Users/{uid}/Items/{item_id}")
+    info = api(f"/Items/{item_id}/PlaybackInfo?" + q(userId=uid), method="POST",
+               body={"UserId": uid, "EnableDirectPlay": True, "EnableDirectStream": True}, timeout=90)
+    raw = info.get("MediaSources") or []
+    if not raw:
+        raise RuntimeError("No streams available for this title yet")
+    by_id = {src["Id"]: src for src in raw}
+    for sid in skip:
+        if sid in by_id:
+            mark_bad(item_id, sid, "didn't play")
+    listing = sources(item_id, info)["sources"]
+    if source_id:
+        if source_id not in by_id:
+            raise RuntimeError("That source is gone - pick another")
+        order = [source_id]                                 # explicit pick: try exactly that one
+    else:
+        order = [e["id"] for e in listing if not e["bad"]] or [e["id"] for e in listing]
+    best, tried = None, []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for start in range(0, len(order), 3):
+            batch = order[start:start + 3]
+            results = list(pool.map(lambda sid: probe(_stream_url(base, token, item_id, sid)), batch))
+            for sid, result in zip(batch, results):
+                tried.append(sid)
+                if result == "ok":
+                    best = by_id[sid]
+                    if source_id:
+                        clear_bad(item_id, sid)
+                    break
+                mark_bad(item_id, sid, _why(result))
+            if best:
+                break
+    if not best:
+        listing = sources(item_id, info)["sources"]
+        if source_id:
+            why = next((e["bad"] for e in listing if e["id"] == source_id), "") or "didn't answer"
+            raise RuntimeError(f"That source isn't playable right now ({why}) - pick another")
+        raise RuntimeError(f"None of the {len(tried)} sources is ready right now (debrid still downloading). "
+                           "Try again in a few minutes")
+    listing = sources(item_id, info)["sources"]
+    entry = card(item)
+    stream = _stream_url(base, token, item_id, best["Id"])
+    resume = entry["position"] if not entry["played"] and entry["position"] > 30 else 0
+    title = entry["title"]
+    artist = entry["subtitle"] if entry["type"] == "episode" else " · ".join(
+        p for p in (str(entry["year"] or ""), describe(best)) if p)
+    return {
+        "ok": True, "provider": "remux", "id": item_id, "url": f"remux:{item_id}",
+        "title": title, "artist": artist, "duration": entry["runtime"], "live": False,
+        "source": stream, "resume": resume, "quality": describe(best),
+        "mediaSourceId": best["Id"], "playSessionId": info.get("PlaySessionId") or "",
+        "type": entry["type"], "seriesId": entry["seriesId"], "poster": entry["poster"],
+        "backdrop": entry["backdrop"], "sources": len(raw), "sourceList": listing,
+        "skipped": len(tried) - 1,
+    }
+
+
+# ---------------------------------------------------------------- progress
+
+def report(path, data, paused):
+    body = {
+        "ItemId": data["id"], "MediaSourceId": data.get("source") or None,
+        "PlaySessionId": data.get("session") or None,
+        "PositionTicks": int(max(0, float(data.get("position") or 0)) * TICKS),
+        "IsPaused": paused, "PlayMethod": "DirectPlay", "CanSeek": True,
+    }
+    api(path, method="POST", body=body)
+
+
+def progress(data):
+    if data.get("start"):
+        report("/Sessions/Playing", data, False)
+    report("/Sessions/Playing/Progress", data, bool(data.get("paused")))
+    return {"ok": True}
+
+
+def stopped(data):
+    report("/Sessions/Playing/Stopped", data, True)
+    length = float(data.get("length") or 0)
+    runtime = float(data.get("runtime") or 0)
+    # The title's real runtime wins: a 2-minute placeholder clip must never mark an episode watched.
+    if runtime > 0 and (length <= 0 or abs(length - runtime) > 300):
+        length = runtime
+    if length > 0 and float(data.get("position") or 0) >= length * 0.92:
+        _, _, uid = config()
+        api(f"/UserPlayedItems/{data['id']}?" + q(userId=uid), method="POST")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- browse
+
+def _search_type(types, query, limit):
+    _, _, uid = config()
+    data = api("/Items?" + q(searchTerm=query, IncludeItemTypes=types, Recursive="true", Limit=limit,
+                             userId=uid, Fields=FIELDS))
+    return [card(i) for i in data.get("Items", []) if i.get("Type") == types]
+
+
+def _relevance(item, query):
+    title = (item.get("title") or "").lower()
+    needle = query.strip().lower()
+    return 0 if title == needle else 1 if title.startswith(needle) else 2
+
+
+def search(kind, query):
+    """Own type first; strong title matches of the other type follow (e.g. a show searched under Movies)."""
+    primary = {"movie": "Movie", "series": "Series"}[kind]
+    other = "Series" if primary == "Movie" else "Movie"
+    own = _search_type(primary, query, 30)
+    cross = [i for i in _search_type(other, query, 8) if _relevance(i, query) < 2][:3]
+    exact_cross = [i for i in cross if _relevance(i, query) == 0]
+    rest_cross = [i for i in cross if _relevance(i, query) != 0]
+    exact_own = [i for i in own if _relevance(i, query) == 0]
+    items = exact_own + exact_cross + [i for i in own if _relevance(i, query) != 0] + rest_cross
+    return {"ok": True, "items": items}
+
+
+def seasons(series_id):
+    _, _, uid = config()
+    data = api(f"/Shows/{series_id}/Seasons?" + q(userId=uid, Fields="UserData,ImageTags"))
+    items = [{"id": s["Id"], "number": s.get("IndexNumber", 0), "name": s.get("Name", ""),
+              "unplayed": (s.get("UserData") or {}).get("UnplayedItemCount")} for s in data.get("Items", [])]
+    items.sort(key=lambda s: (s["number"] == 0, s["number"]))  # specials last
+    return {"ok": True, "items": items}
+
+
+def episodes(series_id, season_id):
+    _, _, uid = config()
+    data = api(f"/Shows/{series_id}/Episodes?" + q(userId=uid, seasonId=season_id, Fields=FIELDS))
+    return {"ok": True, "items": [card(i) for i in data.get("Items", [])]}
+
+
+def show(item_id):
+    """Series card for an episode (or series) id, plus the episode's season id."""
+    _, _, uid = config()
+    item = api(f"/Users/{uid}/Items/{item_id}")
+    if item.get("Type") == "Episode":
+        series = api(f"/Users/{uid}/Items/{item['SeriesId']}?" + q(Fields=FIELDS))
+        return {"ok": True, "item": card(series), "seasonId": item.get("SeasonId") or "",
+                "season": item.get("ParentIndexNumber"), "episodeId": item_id}
+    if item.get("Type") == "Series":
+        return {"ok": True, "item": card(item), "seasonId": "", "season": None, "episodeId": ""}
+    return {"ok": False, "error": "Not part of a series"}
+
+
+def unplayed(item_id):
+    _, _, uid = config()
+    api(f"/UserPlayedItems/{item_id}?" + q(userId=uid), method="DELETE")
+    return {"ok": True}
+
+
+def next_episode(item_id):
+    _, _, uid = config()
+    item = api(f"/Users/{uid}/Items/{item_id}")
+    if item.get("Type") != "Episode":
+        return {"ok": True, "item": None}
+    data = api(f"/Shows/{item['SeriesId']}/Episodes?" + q(userId=uid, Fields=FIELDS, StartItemId=item_id, Limit=2))
+    items = data.get("Items", [])
+    following = next((i for i in items if i["Id"] != item_id), None)
+    return {"ok": True, "item": card(following) if following else None}
+
+
+def continue_watching():
+    _, _, uid = config()
+    resume = api("/UserItems/Resume?" + q(userId=uid, Limit=20, MediaTypes="Video", Fields=FIELDS)).get("Items", [])
+    nextup = api("/Shows/NextUp?" + q(userId=uid, Limit=20, Fields=FIELDS)).get("Items", [])
+    seen, items = set(), []
+    for item in resume + nextup:
+        key = item.get("SeriesId") or item["Id"]
+        if key not in seen:
+            seen.add(key)
+            items.append(card(item))
+    return {"ok": True, "items": items}
+
+
+def favorites():
+    _, _, uid = config()
+    data = api("/Items?" + q(userId=uid, Filters="IsFavorite", IncludeItemTypes="Movie,Series", Recursive="true",
+                             SortBy="SortName", Fields=FIELDS))
+    return {"ok": True, "items": [card(i) for i in data.get("Items", [])]}
+
+
+def favorite(item_id, state):
+    _, _, uid = config()
+    api(f"/UserFavoriteItems/{item_id}?" + q(userId=uid), method="POST" if state == "on" else "DELETE")
+    return {"ok": True, "favorite": state == "on"}
+
+
+def home():
+    _, _, uid = config()
+    rows = [{"id": "continue", "title": "Continue watching", "items": continue_watching()["items"]}]
+    views = api(f"/Users/{uid}/Views").get("Items", [])
+    for view in views:
+        if view.get("CollectionType") not in ("movies", "tvshows", "boxsets"):
+            continue
+        data = api("/Items?" + q(userId=uid, ParentId=view["Id"], Limit=30, Fields=FIELDS, Recursive="true",
+                                 IncludeItemTypes="Movie,Series,BoxSet"))
+        items = [card(i) for i in data.get("Items", []) if i.get("Type") in ("Movie", "Series")]
+        if items:
+            rows.append({"id": view["Id"], "title": view.get("Name", ""), "items": items})
+    return {"ok": True, "rows": rows}
+
+
+# ---------------------------------------------------------------- browse home
+
+SORTS = {
+    "featured": ("", ""),
+    "rating": ("CommunityRating,SortName", "Descending"),
+    "newest": ("PremiereDate,SortName", "Descending"),
+    "az": ("SortName", "Ascending"),
+}
+GENRES = {
+    "movie": ["Action", "Science Fiction", "Comedy", "Thriller", "Animation", "Horror", "Drama", "Crime", "Romance", "Documentary"],
+    "series": ["Drama", "Crime", "Comedy", "Sci-Fi & Fantasy", "Mystery", "Animation", "Action & Adventure", "Documentary"],
+}
+ROW_PAGE = 24
+
+
+def _views(kind):
+    _, _, uid = config()
+    want = "movies" if kind == "movie" else "tvshows"
+    views = api(f"/Users/{uid}/Views").get("Items", [])
+    lib = [v for v in views if v.get("CollectionType") == want]
+    sets = api(f"/Users/{uid}/Items?" + q(IncludeItemTypes="BoxSet", Recursive="true", Limit=100)).get("Items", [])
+    lib_ids = {v["Id"] for v in views}
+    noun = "movie" if kind == "movie" else "show"
+    extra = [s for s in sets if s["Id"] not in lib_ids and noun in s.get("Name", "").lower()]
+    return lib, extra
+
+
+def _row_specs(kind):
+    lib, extra = _views(kind)
+    item_type = "Movie" if kind == "movie" else "Series"
+    everything = next((v for v in lib if v.get("Name") in ("Movies", "Shows")), None)
+    specs = []
+    order = {"trending": 0, "popular": 1}
+    total_all = _count({"IncludeItemTypes": item_type})
+    for view in sorted([v for v in lib if v is not everything],
+                       key=lambda v: next((n for k, n in order.items() if k in v.get("Name", "").lower()), 5)):
+        # Filter-based libraries that just mirror the whole library add nothing as a row.
+        if _count({"IncludeItemTypes": item_type, "ParentId": view["Id"]}) >= total_all:
+            continue
+        specs.append({"id": f"parent:{view['Id']}", "title": view.get("Name", ""), "sort": "featured"})
+    for box in extra:
+        specs.append({"id": f"parent:{box['Id']}", "title": box.get("Name", ""), "sort": "featured"})
+    specs.append({"id": f"all:{item_type}", "title": "Top rated", "sort": "rating"})
+    specs.append({"id": f"all:{item_type}", "title": "New releases", "sort": "newest"})
+    for genre in GENRES[kind]:
+        specs.append({"id": f"genre:{genre}", "title": genre.replace("Science Fiction", "Sci-Fi"), "sort": "rating"})
+    return specs
+
+
+def _count(params):
+    _, _, uid = config()
+    data = api("/Items?" + q(userId=uid, Limit=0, Recursive="true", EnableTotalRecordCount="true", **params))
+    return data.get("TotalRecordCount", 0)
+
+
+def row(kind, row_id, sort="featured", start=0, limit=ROW_PAGE):
+    _, _, uid = config()
+    item_type = "Movie" if kind == "movie" else "Series"
+    sort_by, order = SORTS.get(sort, SORTS["featured"])
+    params = dict(userId=uid, Limit=limit, StartIndex=int(start), Fields=FIELDS, Recursive="true",
+                  IncludeItemTypes=item_type, SortBy=sort_by or None, SortOrder=order or None,
+                  EnableTotalRecordCount="true")
+    source, _, value = row_id.partition(":")
+    if source == "parent":
+        params["ParentId"] = value
+    elif source == "genre":
+        params["Genres"] = value
+    elif source != "all":
+        raise RuntimeError(f"Unknown row {row_id}")
+    # Remux ignores MinCommunityRating; for "New releases" skip placeholder entries
+    # (no overview / the default 6.5 score) by over-fetching and filtering here.
+    picky = sort == "newest" and source != "parent"
+    if picky:
+        params["Limit"] = limit * 4
+    data = api("/Items?" + q(**params))
+    raw = [i for i in data.get("Items", []) if i.get("Type") == item_type]
+    if picky:
+        raw = [i for i in raw if i.get("Overview") and (i.get("CommunityRating") or 0) > 6.6][:limit]
+    items = [card(i) for i in raw]
+    fetched = len(data.get("Items", []))
+    return {"ok": True, "id": row_id, "sort": sort, "start": int(start), "items": items,
+            "next": int(start) + fetched, "total": data.get("TotalRecordCount", len(items))}
+
+
+def browse(kind):
+    if kind not in ("movie", "series"):
+        raise RuntimeError("kind must be movie or series")
+    specs = _row_specs(kind)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        pages = list(pool.map(lambda spec: _safe_row(kind, spec), specs))
+    want = "movie" if kind == "movie" else "episode"
+    resume = [i for i in continue_watching()["items"] if i["type"] == want]
+    rows = []
+    if resume:
+        rows.append({"id": "continue", "title": "Continue watching", "sort": "", "items": resume, "total": len(resume)})
+    for spec, page in zip(specs, pages):
+        if page and page["items"]:
+            rows.append({**spec, "items": page["items"], "total": page["total"]})
+    hero = next((i for r in rows if r["id"] != "continue" for i in r["items"] if i.get("backdrop") and i.get("overview")), None)
+    return {"ok": True, "kind": kind, "rows": rows, "hero": hero, "quality": max_quality()}
+
+
+def _safe_row(kind, spec):
+    try:
+        return row(kind, spec["id"], spec["sort"])
+    except Exception:
+        return None
+
+
+def main(argv):
+    command = argv[1] if len(argv) > 1 else "continue"
+    args = argv[2:]
+    try:
+        if command == "search":
+            result = search(args[0], args[1])
+        elif command == "seasons":
+            result = seasons(args[0])
+        elif command == "episodes":
+            result = episodes(args[0], args[1])
+        elif command == "resolve":
+            skip = []
+            if "--skip" in args:
+                at = args.index("--skip")
+                skip = [x for x in (args[at + 1] if at + 1 < len(args) else "").split(",") if x]
+                args = args[:at] + args[at + 2:]
+            result = resolve(args[0].removeprefix("remux:"), args[1] if len(args) > 1 and args[1] else None, skip)
+        elif command == "sources":
+            result = sources(args[0].removeprefix("remux:"))
+        elif command == "badsource":
+            result = mark_bad(args[0].removeprefix("remux:"), args[1], args[2] if len(args) > 2 else "didn't play")
+        elif command == "unplayed":
+            result = unplayed(args[0].removeprefix("remux:"))
+        elif command == "progress":
+            result = progress(json.loads(args[0]))
+        elif command == "stopped":
+            result = stopped(json.loads(args[0]))
+        elif command == "continue":
+            result = continue_watching()
+        elif command == "favorites":
+            result = favorites()
+        elif command == "favorite":
+            result = favorite(args[0], args[1])
+        elif command == "show":
+            result = show(args[0].removeprefix("remux:"))
+        elif command == "next":
+            result = next_episode(args[0])
+        elif command == "home":
+            result = home()
+        elif command == "browse":
+            result = browse(args[0] if args else "movie")
+        elif command == "row":
+            result = row(args[0], args[1], args[2] if len(args) > 2 else "featured", args[3] if len(args) > 3 else 0)
+        elif command == "share":
+            result = share(args[0].removeprefix("remux:"))
+        elif command == "handoff":
+            result = handoff(args[0].removeprefix("remux:"), args[1] if len(args) > 1 else 0)
+        elif command == "match":
+            result = match(*(args + ["", "", "", "0"])[:4])
+        elif command == "lookup":
+            result = lookup(" ".join(args))
+        elif command == "tiers":
+            result = tiers(args[0])
+        elif command == "quality":
+            result = set_quality(args[0]) if args else {"ok": True, "quality": max_quality()}
+        else:
+            out({"ok": False, "error": f"Unknown command: {command}"})
+            return 2
+    except Exception as error:
+        message = re.sub(r"api_key=[0-9a-f]+", "api_key=<hidden>", str(error) or error.__class__.__name__)
+        out({"ok": False, "error": message})
+        return 1
+    out(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

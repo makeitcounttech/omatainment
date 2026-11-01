@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "empire.omatainment",
+  "name": "OmaTainment",
+  "version": "2.0.0",
+  "author": "makeitcount.tech",
+  "license": "MIT",
+  "description": "OmaTainment: Music, YouTube, Movies and Series in the top bar. YouTube music with queue and favourites, YouTube video, and Movies/Series via Remux with source picker, automatic failover for debrid links that aren't ready, pop-out/fullscreen player and phone hand-off.",
+  "homepage": "https://github.com/MaenExists/omaopus",
+  "repository": "https://github.com/MaenExists/omaopus",
+  "keywords": [
+    "music",
+    "youtube",
+    "movies",
+    "series",
+    "remux",
+    "streaming",
+    "player",
+    "bar-widget",
+    "quickshell",
+    "omarchy"
+  ],
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaTainment — Music, YouTube, Movies & Series",
+    "description": "Music, YouTube, Movies and Series from the top bar; playback survives closing the panel.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
