@@ -1,35 +1,116 @@
-# OmaTainment
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="OmaTainment: music, video and your media library in your Omarchy bar" width="100%">
+</p>
 
-Music, YouTube video and Remux library controls in the Omarchy bar, with queue, pop-out playback and optional phone handoff. The public display name is OmaTainment; the repository name is omatainment and the plugin ID remains empire.omatainment. Maintained by makeitcount.tech.
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2de2e6?style=flat-square&labelColor=0b0f14"></a>
+  <img alt="Omarchy plugin" src="https://img.shields.io/badge/Omarchy-plugin-2de2e6?style=flat-square&labelColor=0b0f14">
+  <img alt="Quickshell" src="https://img.shields.io/badge/built_with-Quickshell%20%2F%20QML-e9eef2?style=flat-square&labelColor=0b0f14">
+  <img alt="mpv" src="https://img.shields.io/badge/player-mpv-e9eef2?style=flat-square&labelColor=0b0f14">
+  <a href="https://github.com/makeitcounttech/omatainment/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/makeitcounttech/omatainment?style=flat-square&color=2de2e6&labelColor=0b0f14"></a>
+</p>
 
-## Requirements
+<p align="center">
+  <b>Music, YouTube, movies and series, one click away in your top bar.</b><br>
+  No heavy browser tabs. No extra windows to juggle.
+</p>
 
-Source baseline: Omarchy 4.0.4-1, Quickshell/QtQuick/QtMultimedia and shell Commons/Ui modules; Python 3; Bash; mpv; yt-dlp; ffmpeg; PipeWire tools (`pw-cat`) and optional NumPy for visualization. Remux, Docker-based local startup, KDE Connect and Moonfin/NewPipe phone integrations are optional and separately configured; no service, library, credential or phone is supplied.
+---
 
-## First run
+## ✦ What it does
 
-Enable the widget in a fresh test account and configure your own media sources. Remux reads `~/.config/omatainment/remux.json` with `url`, `token` and `userId`; keep that file private and outside this checkout. A generic URL is `https://media.example.com`. Remote handoff requires an explicit `OMATAINMENT_REMOTE_SSH` value (for example `alice@example.com`) and `OMATAINMENT_REMOTE_REMUX` for the remote loopback URL. It refuses before reading credentials when the destination is unset or invalid. Destinations must be plain host/SSH aliases, optionally prefixed with a username; options, whitespace and shell syntax are rejected. The remote URL must use HTTP(S) and loopback (`localhost`, `127.0.0.1` or `[::1]`), with an optional valid port and simple path; userinfo, queries, fragments and shell punctuation are rejected. SSH options are terminated before the destination and every remote command argument is shell-quoted. Remote handoff assumes matching item/server identities. Only configure a trusted destination.
+OmaTainment turns the Omarchy bar into your **entertainment hub**. Search a song, queue a YouTube video, or open a film from your own library, then pop it out, go fullscreen or hand it to your phone.
 
-## Limitations
+<table>
+<tr>
+<td width="50%" valign="top">
 
-No media, audio, GUI, phone, network or install smoke test was performed. Third-party availability, content licensing and codec support are external dependencies. Only play content you have rights to access. The old remote-host-specific environment names are replaced by the generic REMOTE names above. Upstream marketing performance claims and marketplace badges are not verified and are omitted here.
+### 🎵 Music
+YouTube music with **instant search**, a **queue**, **favourites** and continuous autoplay. A live **spectrum visualizer** dances along in the panel.
 
-## Credits and license
+### 📺 YouTube video
+Play videos in a **pop-out** player or **fullscreen** on any monitor, with clean on-screen controls.
 
-Fork of MaenExists/omaopus (https://github.com/MaenExists/omaopus), MIT. Original Copyright (c) 2026 MaenExists and the complete MIT notice remain in LICENSE. Manifest upstream links identify provenance, not the destination of this unpublished fork.
+### 🎬 Movies & series
+Browse your **Remux / Jellyfin-style library**, pick a source, and let **automatic failover** skip links that aren't ready yet.
 
-## Install
+</td>
+<td width="50%" valign="top">
 
-This is a local release-preparation tree, not a published repository. Publication requires separate approval. Do not install over an existing plugin without backing it up and reviewing conflicts.
+### 📱 Phone hand-off
+Send what's playing to your phone and keep watching on the couch. It works over your own trusted connection.
 
-For a fresh test account with no existing plugin, copy this repository's runtime files (excluding `.git`, `.github`, `scripts`, and `tests`) into `~/.config/omarchy/plugins/empire.omatainment/`, retaining the root `manifest.json` and its relative entry-point layout. Use the Omarchy plugin settings to enable it. No install, enable, or desktop restart has been exercised for this release preparation.
+### ⚡ Lightweight by design
+Built on **mpv** and native Quickshell/QML, it lives in the bar instead of a browser. The icon even reacts: it shows equalizer bars while music plays and breathes while a video runs.
 
-## Uninstall
+### 🔐 Your media, your config
+Library credentials stay in your own private config file, never inside the plugin.
 
-Disable the plugin in Omarchy first, then remove only its own plugin directory. Back up any settings you want to keep; removing the plugin does not necessarily remove user state or external services. Do not stop a routing service with active capture.
+</td>
+</tr>
+</table>
 
-## Development checks
+## ⚡ Quick start
 
-Install Python 3.13, Node.js, ruff 0.17.2, shellcheck-py 0.11.0.1 and gitleaks 8.30.1. Run `bash scripts/privacy-scan.sh`, `python -B scripts/lint.py`, and `gitleaks dir . --redact`. After committing, run `bash scripts/privacy-scan.sh --commit HEAD` and `gitleaks git . --redact --log-opts=--all`. CI repeats these checks. QML lint runs when qmllint and its Qt/Quickshell imports are available; otherwise its absence is explicitly reported, not counted as a pass.
+```bash
+# Dependencies (Arch / Omarchy)
+sudo pacman -S --needed mpv yt-dlp ffmpeg pipewire python-numpy
 
-The privacy policy scans file names and contents, including untracked files, and can read committed blobs independently of the working tree. It rejects internal domains, shared-address-space IPs (no exceptions currently), personal home/work paths, agent identities, host roles, and unapproved emails. Omarchy as a platform/product/API name is allowed; Omarchy used as an SSH/HTTP host is not. The exact email allowlist is `alice@example.com` (documentation), `noreply@paperclip.ing` (commit attribution), and `hello@makeitcount.tech` (approved public author/committer identity only, not an email support channel). Examples use `example.com`, `192.0.2.10` or `198.51.100.11`; never real credentials.
+# Install the plugin (back up any existing copy first)
+mkdir -p ~/.config/omarchy/plugins/empire.omatainment
+git clone https://github.com/makeitcounttech/omatainment.git /tmp/omatainment
+rsync -a --exclude '.git' --exclude '.github' --exclude 'scripts' --exclude 'tests' \
+  /tmp/omatainment/ ~/.config/omarchy/plugins/empire.omatainment/
+```
+
+Then open **Omarchy → Plugins**, enable **OmaTainment**, and click the ▶ icon in your bar.
+
+<details>
+<summary><b>Optional: connect your media library</b></summary>
+
+Create `~/.config/omatainment/remux.json` (keep it private, outside any repo):
+
+```json
+{ "url": "https://media.example.com", "token": "YOUR-API-TOKEN", "userId": "YOUR-USER-ID" }
+```
+</details>
+
+<details>
+<summary><b>Optional: phone hand-off</b></summary>
+
+Set `OMATAINMENT_REMOTE_SSH` (for example `alice@example.com`) and `OMATAINMENT_REMOTE_REMUX` (a loopback URL such as `http://127.0.0.1:8096`). Hand-off refuses to run before reading any credentials if a destination is missing or looks unsafe. Only point it at a machine you trust.
+</details>
+
+## 🧩 Requirements
+
+| | |
+|---|---|
+| **Desktop** | [Omarchy](https://omarchy.org) 4.x (Hyprland + Quickshell, QtMultimedia) |
+| **Playback** | mpv, yt-dlp, ffmpeg, PipeWire (`pw-cat`) |
+| **Optional** | NumPy (visualizer), a Remux/Jellyfin-compatible server, KDE Connect |
+
+Only play content you have the rights to access.
+
+<details>
+<summary><b>Development checks</b></summary>
+
+```bash
+bash scripts/privacy-scan.sh
+python -B scripts/lint.py
+python -B -m unittest discover tests
+gitleaks dir . --redact
+```
+</details>
+
+## 💜 Credits & license
+
+OmaTainment started as a fork of [**omaopus**](https://github.com/MaenExists/omaopus) by MaenExists. Huge thanks for the foundation. We extended it with video, movies & series, failover, pop-out playback and phone hand-off.
+
+MIT. The original copyright notice is kept in [LICENSE](LICENSE). Extensions © [makeitcount.tech](https://makeitcount.tech).
+
+---
+
+<p align="center">
+  <a href="https://makeitcount.tech"><img src=".github/assets/mct.svg" alt="makeitcount" height="28"></a><br>
+  <sub><b>Build a digital life you control.</b> · More from us: <a href="https://github.com/makeitcounttech/omarouting">OmaRouting</a></sub>
+</p>
